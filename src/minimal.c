@@ -4,9 +4,14 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/resource.h>
+#include <getopt.h>
+#include <signal.h>
+
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <bpf/btf.h>
+
+#include "minimal.h"
 #include "minimal.skel.h"
 #include "trace_helpers.h"
 
@@ -34,20 +39,19 @@ static void bump_open_file_rlimit(void)
 }
 
 /*
-static void bump_memlock_rlimit(void)
-{
-	struct rlimit rlim_new = {
-		.rlim_cur	= RLIM_INFINITY,
-		.rlim_max	= RLIM_INFINITY,
-	};
+   static void bump_memlock_rlimit(void)
+   {
+   struct rlimit rlim_new = {
+   .rlim_cur	= RLIM_INFINITY,
+   .rlim_max	= RLIM_INFINITY,
+   };
 
-	if (setrlimit(RLIMIT_MEMLOCK, &rlim_new)) {
-		fprintf(stderr, "Failed to increase RLIMIT_MEMLOCK limit!\n");
-		exit(1);
-	}
-}
-*/
-
+   if (setrlimit(RLIMIT_MEMLOCK, &rlim_new)) {
+   fprintf(stderr, "Failed to increase RLIMIT_MEMLOCK limit!\n");
+   exit(1);
+   }
+   }
+   */
 static struct ksyms *ksyms;
 static struct btf *vmlinux_btf;
 static struct minimal_bpf *skel;
@@ -69,57 +73,12 @@ static struct bpf_program *fexits[MAX_FUNC_ARG_CNT + 1];
 static struct func_info func_infos[50000];
 static struct func_info *func_infos_by_arg_cnt[MAX_FUNC_ARG_CNT + 1][30000];
 
-static int kprobe_cnt;
-static char *kprobes[50000];
-static char buf[512];
-static char buf2[512];
-
-static int str_cmp(const void *a, const void *b)
-{
-	const char * const *s1 = a, * const *s2 = b;
-
-	return strcmp(*s1, *s2);
-}
-
-static void load_available_kprobes(void)
-{
-	const char *fname = "/sys/kernel/tracing/available_filter_functions";
-	FILE *f;
-	int cnt;
-
-	f = fopen(fname, "r");
-	if (!f) {
-		fprintf(stderr, "Failed to open %s: %d\n", fname, -errno);
-		exit(1);
-	}
-
-	while ((cnt = fscanf(f, "%s%[^\n]\n", buf, buf2)) == 1) {
-		kprobes[kprobe_cnt++] = strdup(buf);
-	}
-
-	qsort(kprobes, kprobe_cnt, sizeof(char *), str_cmp);
-	printf("READ %d AVAILABLE KPROBES!\n", kprobe_cnt);
-}
-
-static bool is_kprobe_ok(const char *name)
-{
-	void *r;
-
-	if (strcmp(name, "__x64_sys_getpgid") == 0) 
-		r = NULL;
-	r = bsearch(&name, kprobes, kprobe_cnt, sizeof(void *), str_cmp);
-
-	return r != NULL;
-}
-
 static int func_arg_cnt(const struct btf *btf, int id)
 {
 	const struct btf_type *t;
 
 	t = btf__type_by_id(btf, id);
-	t = btf__type_by_id(btf, t->type);
-	return btf_vlen(t);
-}
+	t = btf__type_by_id(btf, t->type); return btf_vlen(t); }
 
 static int prog_arg_cnt(const struct bpf_program *p)
 {
@@ -134,6 +93,7 @@ static int prog_arg_cnt(const struct bpf_program *p)
 }
 
 static int prepped_cnt;
+static int child_cnt;
 
 static int prep_prog(struct bpf_program *prog, int n,
 		     struct bpf_insn *insns, int insns_cnt,
@@ -150,7 +110,7 @@ static int prep_prog(struct bpf_program *prog, int n,
 	prepped_cnt++;
 	if (prepped_cnt % 1000 == 0) {
 		printf("prepping prog %s (total %d): func %s, arg cnt %d, instance #%d, btf set to %d\n",
-			bpf_program__name(prog), prepped_cnt, finfo->name, arg_cnt, n, finfo->btf_id);
+		       bpf_program__name(prog), prepped_cnt, finfo->name, arg_cnt, n, finfo->btf_id);
 	}
 
 	res->new_insn_ptr = insns;
@@ -195,18 +155,6 @@ static bool is_ok_func(const struct btf *btf, const struct btf_type *t)
 	return true;
 }
 
-/*
-const struct ksym *ksyms__map_addr(const struct ksyms *ksyms,
-				   unsigned long addr);
-const struct ksym *ksyms__get_symbol(const struct ksyms *ksyms,
-				     const char *name);
-*/
-
-static const char *whitelist[] = {
-	"__x64_sys_",
-	NULL,
-};
-
 static const char *blacklist[] = {
 	"bpf_get_smp_processor_id",
 	"mm_init",
@@ -224,9 +172,82 @@ static const char *blacklist[] = {
 	NULL,
 };
 
+static volatile bool exiting = false;
+
+static void sig_handler(int sig)
+{
+	exiting = true;
+}
+
+static __u64 duration(const struct timing *t) {
+	return t->exit_ns - t->enter_ns;
+}
+
+int handle_event(void *ctx, void *data, size_t data_sz)
+{
+	const struct timing_event *e = data;
+	char parent_fn[64];
+	char child_fn[64];
+	int i;
+	__u64 parent_duration;
+	__u64 child_duration;
+
+	bpf_map_lookup_elem(bpf_map__fd(skel->maps.ip_to_name), &(e->ectx.ip), parent_fn);
+	parent_duration = duration(&(e->t));
+	printf("%s %d took %llu ns\n", parent_fn, e->ectx.pid, parent_duration);
+	for (i = 0; i < child_cnt; ++i) {
+		bpf_map_lookup_elem(bpf_map__fd(skel->maps.ip_to_name), &(e->children[i].ip), child_fn);
+		child_duration = e->children[i].sum_ns;
+		printf("\t%s %d calls %llu ns %f%%\n", child_fn, e->children[i].count, child_duration, (double)child_duration / (double)parent_duration * 100);
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	int err, i, func_skip = 0, j;
+
+	char c;
+	char *parent;
+	char *children[MAX_CHILDREN];
+	unsigned long long threshold = 1000000000;
+	char *endptr;
+	struct ring_buffer *rb = NULL;
+
+	/* Clean handling of Ctrl-C */
+	signal(SIGINT, sig_handler);
+	signal(SIGTERM, sig_handler);
+
+	child_cnt = 0;
+	while (1) {
+		c = getopt(argc, argv, "p:c:t:");
+		if (c < 0)
+			break;
+		switch(c) {
+		case 'p':
+			printf("parent optarg: %s(%lu)\n", optarg, strlen(optarg));
+			parent = malloc(strlen(optarg) + 1);
+			if (!parent)
+				return ENOMEM;
+			strcpy(parent, optarg);
+			printf("parent: %s\n", parent);
+			break;
+		case 'c':
+			children[child_cnt] = malloc(strlen(optarg) + 1);
+			if (!children[child_cnt])
+				return ENOMEM;
+			strcpy(children[child_cnt], optarg);
+			printf("child: %s\n", children[child_cnt]);
+			++child_cnt;
+			break;
+		case 't':
+			threshold = strtoull(optarg, &endptr, 10);
+			break;
+		default:
+			fprintf(stderr, "Inalid option: %s\n", optarg);
+			return 1;
+		}
+	}
 
 	ksyms = ksyms__load();
 	if (!ksyms) {
@@ -243,9 +264,6 @@ int main(int argc, char **argv)
 	/* Allow opening lots of BPF programs */
 	bump_open_file_rlimit();
 
-	/* Load names of possible kprobes */
-	load_available_kprobes();
-
 	/* Open BPF application */
 	skel = minimal_bpf__open();
 	if (!skel) {
@@ -253,9 +271,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Failed to open BPF skeleton\n");
 		goto cleanup;
 	}
-
-	/* ensure BPF program only handles write() syscalls from our process */
-	skel->bss->my_pid = getpid();
+	skel->bss->threshold = threshold;
 
 	fentries[0] = skel->progs.fentry0;
 	fentries[1] = skel->progs.fentry1;
@@ -287,15 +303,14 @@ int main(int argc, char **argv)
 	if (err) {
 		fprintf(stderr, "Failed to load vmlinux BTF: %d\n", err);
 		goto cleanup;
-	}
-
-	for (i = 1; i <= btf__get_nr_types(vmlinux_btf); i++) {
+	} for (i = 1; i <= btf__get_nr_types(vmlinux_btf); i++) {
 		const struct btf_type *t = btf__type_by_id(vmlinux_btf, i);
 		const char *func_name;
 		const struct ksym *ksym;
 		struct func_info *finfo;
 		int arg_cnt;
 		bool skip = false;
+		bool parent_match = false;
 
 		if (!btf_is_func(t))
 			continue;
@@ -307,17 +322,19 @@ int main(int argc, char **argv)
 			func_skip++;
 			continue;
 		}
-		if (whitelist[0]) {
-			for (j = 0; whitelist[j]; j++) {
-				if (strncmp(func_name, whitelist[j], strlen(whitelist[j])) == 0) {
-					printf("FUNC '%s' is whitelisted!\n", func_name);
-					goto proceed;
-				}
-			}
-			func_skip++;
-			skip = true;
-			continue;
+		if (!strcmp(func_name, parent)) {
+			parent_match = true;
+			goto proceed;
 		}
+		if (child_cnt) {
+			for (j = 0; j < child_cnt; ++j) {
+				if (!strcmp(func_name, children[j]))
+					goto proceed;
+			}
+		}
+		func_skip++;
+		skip = true;
+		continue;
 proceed:
 		for (j = 0; blacklist[j]; j++) {
 			if (strncmp(func_name, blacklist[j], strlen(blacklist[j])) == 0) {
@@ -329,31 +346,20 @@ proceed:
 		}
 		if (skip)
 			continue;
-		if (!is_kprobe_ok(func_name)) {
-			//printf("FUNC '%s' is not attachable kprobe, skipping!\n", func_name);
-			func_skip++;
-			continue;
-		}
 		if (!is_ok_func(vmlinux_btf, t)) {
-			//printf("FUNC '%s' has incompatible prototype, skipping!\n", func_name);
 			func_skip++;
 			continue;
 		}
-
-		/*
-		if (func_cnt > 10000)
-			break;
-		*/
 
 		finfo = &func_infos[func_cnt++];
 		finfo->btf_id = i;
 		finfo->addr = ksym->addr;
 		finfo->name = ksym->name;
+		if (parent_match)
+			skel->bss->parent_ip = finfo->addr;
 
 		arg_cnt = func_arg_cnt(vmlinux_btf, i);
 		func_infos_by_arg_cnt[arg_cnt][func_info_cnts[arg_cnt]++] = finfo;
-
-		//printf("FOUND %s, ADDR 0x%lx\n", func_name, ksym->addr);
 	}
 
 	for (i = 0; i <= MAX_FUNC_ARG_CNT; i++) {
@@ -364,6 +370,8 @@ proceed:
 	printf("FOUND %d FUNCS, SKIPPED %d!\n", func_cnt, func_skip);
 
 	bpf_map__set_max_entries(skel->maps.ip_to_name, func_cnt);
+	bpf_map__set_max_entries(skel->maps.execs, 4096);
+	bpf_map__set_max_entries(skel->maps.slots, child_cnt);
 
 	/* Load & verify BPF programs */
 	err = minimal_bpf__load(skel);
@@ -372,6 +380,7 @@ proceed:
 		goto cleanup;
 	}
 
+	int slot = 0;
 	for (i = 0; i < func_cnt; i++) {
 		char buf[64];
 
@@ -385,21 +394,25 @@ proceed:
 			fprintf(stderr, "Failed to add 0x%lx -> '%s' lookup entry!\n", func_infos[i].addr, buf);
 			exit(1);
 		}
+		if (func_infos[i].addr != skel->bss->parent_ip) {
+			printf("child %s taking slot %d\n", func_infos[i].name, slot);
+			errno = 0;
+			err = bpf_map_update_elem(bpf_map__fd(skel->maps.slots), &(func_infos[i].addr), &slot, BPF_NOEXIST);
+			if (err) {
+				printf("err: %d errno: %d\n", err, errno);
+				if (errno != EEXIST)
+					goto cleanup;
+				err = 0;
+				printf("duplicate child fn %s\n", func_infos[i].name);
+			} else
+				++slot;
+		}
 	}
 
-	/* Attach tracepoint handler */
-	/*
-	err = minimal_bpf__attach(skel);
-	if (err) {
-		fprintf(stderr, "Failed to attach BPF skeleton\n");
-		goto cleanup;
-	}
-	*/
 	for (i = 0; i < func_cnt; i++) {
 		int prog_fd;
 
-	//	if (i > 3600)
-			printf("ATTACHED #%d to '%s' (%ld calls)\n", i, func_infos[i].name, skel->bss->calls_traced);
+		printf("ATTACHED #%d to '%s' (parent ip: %ld, threshold: %llu)\n", i, func_infos[i].name, skel->bss->parent_ip, skel->bss->threshold);
 
 		prog_fd = func_infos[i].fentry_prog_fd;
 		err = bpf_raw_tracepoint_open(NULL, prog_fd);
@@ -413,22 +426,28 @@ proceed:
 			fprintf(stderr, "Failed to attach FEXIT prog (fd %d) for func #%d (%s), skipping: %d\n",
 				prog_fd, i, func_infos[i].name, -errno);
 		}
-
-		if ((i + 1) % 100 == 0)
-			printf("ATTACHED %d FUNCS (%ld calls traced)!\n", i + 1, skel->bss->calls_traced);
 	}
 
 	printf("Total %d funcs attached successfully!\n", func_cnt);
 
-	for (;;) {
-		sleep(5);
-		printf("%ld calls traced!\n", skel->bss->calls_traced);
+	// setup ringbuf polling
+	rb = ring_buffer__new(bpf_map__fd(skel->maps.rb), handle_event, NULL, NULL);
+	if (!rb) {
+		err = -1;
+		fprintf(stderr, "Failed to create ring buffer\n");
+		goto cleanup;
 	}
-	sleep(1000000);
+
 	for (;;) {
-		/* trigger our BPF program */
-		//fprintf(stderr, ".");
-		//sleep(1);
+		err = ring_buffer__poll(rb, 100);
+		if (err == -EINTR) {
+			err = 0;
+			break;
+		}
+		if (err < 0) {
+			fprintf(stderr, "Ring buffer polling error: %d\n", err);
+			break;
+		}
 	}
 
 cleanup:
